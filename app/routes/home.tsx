@@ -3,8 +3,12 @@ import { Welcome } from "../welcome/welcome";
 
 export function meta({}: Route.MetaArgs) {
   return [
-    { title: "New React Router App" },
-    { name: "description", content: "Welcome to React Router!" },
+    { title: "Firebase Security Tester" },
+    {
+      name: "description",
+      content:
+        "Probe Firebase Authentication, Realtime Database, Firestore, and Storage permissions from the browser.",
+    },
   ];
 }
 

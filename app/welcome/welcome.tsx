@@ -1,89 +1,565 @@
-import logoDark from "./logo-dark.svg";
-import logoLight from "./logo-light.svg";
+import { useEffect, useMemo, useRef, useState } from "react";
+import JSON5 from "json5";
+import {
+  deleteApp,
+  getApps,
+  initializeApp,
+  type FirebaseApp,
+  type FirebaseOptions,
+} from "firebase/app";
+import { getAuth, signInAnonymously, signOut } from "firebase/auth";
+import { getDatabase, get, ref, set } from "firebase/database";
+import {
+  doc,
+  getDoc,
+  getFirestore,
+  serverTimestamp,
+  setDoc,
+} from "firebase/firestore";
+import { getStorage, listAll, ref as storageRef, uploadString } from "firebase/storage";
+
+type ServiceName = "Authentication" | "Realtime Database" | "Firestore" | "Storage";
+
+type ProbeResult = {
+  id: number;
+  service: ServiceName;
+  action: string;
+  path: string;
+  success: boolean;
+  message: string;
+};
+
+const APP_NAME = "firebase-security-tester";
+
+const SAMPLE_CONFIG = JSON.stringify(
+  {
+    apiKey: "AIza...",
+    authDomain: "your-project.firebaseapp.com",
+    databaseURL: "https://your-project-default-rtdb.firebaseio.com",
+    projectId: "your-project-id",
+    storageBucket: "your-project.appspot.com",
+    messagingSenderId: "1234567890",
+    appId: "1:1234567890:web:abcd1234",
+  },
+  null,
+  2,
+);
+
+function safePreview(value: unknown): string {
+  const stringValue = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  if (!stringValue) {
+    return "(empty result)";
+  }
+
+  return stringValue.length > 240 ? `${stringValue.slice(0, 240)}...` : stringValue;
+}
+
+function normalizeDbPath(pathInput: string): string {
+  const trimmed = pathInput.trim();
+  if (!trimmed || trimmed === "/") {
+    return "/";
+  }
+
+  return `/${trimmed.replace(/^\/+/, "")}`;
+}
+
+function normalizeFirestorePath(pathInput: string): string {
+  const trimmed = pathInput.trim().replace(/^\/+|\/+$/g, "");
+  if (!trimmed) {
+    return "security_test/root_probe";
+  }
+
+  const segments = trimmed.split("/").filter(Boolean);
+  if (segments.length % 2 === 0) {
+    return trimmed;
+  }
+
+  return `${trimmed}/probe_doc`;
+}
+
+function normalizeStoragePath(pathInput: string): string {
+  return pathInput.trim().replace(/^\/+|\/+$/g, "");
+}
+
+function parseFirebaseConfig(rawText: string): { config?: FirebaseOptions; error?: string } {
+  try {
+    let parsed: Record<string, unknown>;
+
+    try {
+      parsed = JSON.parse(rawText) as Record<string, unknown>;
+    } catch {
+      parsed = JSON5.parse(rawText) as Record<string, unknown>;
+    }
+
+    const maybeConfig = (parsed.firebaseConfig ?? parsed) as Record<string, unknown>;
+
+    if (typeof maybeConfig.apiKey !== "string" || typeof maybeConfig.projectId !== "string") {
+      return {
+        error: "Config must include at least apiKey and projectId for client-side testing.",
+      };
+    }
+
+    return { config: maybeConfig as FirebaseOptions };
+  } catch {
+    return {
+      error:
+        "Invalid config format. Paste valid JSON or JavaScript-style object syntax (JSON5 supported).",
+    };
+  }
+}
 
 export function Welcome() {
-  return (
-    <main className="flex items-center justify-center pt-16 pb-4">
-      <div className="flex-1 flex flex-col items-center gap-16 min-h-0">
-        <header className="flex flex-col items-center gap-9">
-          <div className="w-[500px] max-w-[100vw] p-4">
-            <img
-              src={logoLight}
-              alt="React Router"
-              className="block w-full dark:hidden"
-            />
-            <img
-              src={logoDark}
-              alt="React Router"
-              className="hidden w-full dark:block"
-            />
-          </div>
-        </header>
-        <div className="max-w-[300px] w-full space-y-6 px-4">
-          <nav className="rounded-3xl border border-gray-200 p-6 dark:border-gray-700 space-y-4">
-            <p className="leading-6 text-gray-700 dark:text-gray-200 text-center">
-              What&apos;s next?
-            </p>
-            <ul>
-              {resources.map(({ href, text, icon }) => (
-                <li key={href}>
-                  <a
-                    className="group flex items-center gap-3 self-stretch p-3 leading-normal text-blue-700 hover:underline dark:text-blue-500"
-                    href={href}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {icon}
-                    {text}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </nav>
+  const [credentialsJson, setCredentialsJson] = useState(SAMPLE_CONFIG);
+  const [pathInput, setPathInput] = useState("/");
+  const [results, setResults] = useState<ProbeResult[]>([]);
+  const [runningAction, setRunningAction] = useState<string | null>(null);
+  const [appRefreshMessage, setAppRefreshMessage] = useState("Firebase app not initialized yet.");
+  const refreshSeqRef = useRef(0);
+
+  const parsedConfig = useMemo(() => parseFirebaseConfig(credentialsJson), [credentialsJson]);
+
+  useEffect(() => {
+    const refreshId = refreshSeqRef.current + 1;
+    refreshSeqRef.current = refreshId;
+
+    const refreshAppInstance = async () => {
+      const existing = getApps().find((item) => item.name === APP_NAME);
+      if (existing) {
+        await deleteApp(existing);
+      }
+
+      if (!parsedConfig.config) {
+        if (refreshSeqRef.current === refreshId) {
+          setAppRefreshMessage("Invalid config. Existing app instance cleared.");
+        }
+        return;
+      }
+
+      initializeApp(parsedConfig.config, APP_NAME);
+      if (refreshSeqRef.current === refreshId) {
+        setAppRefreshMessage("Firebase app instance refreshed.");
+      }
+    };
+
+    void refreshAppInstance().catch((error: unknown) => {
+      if (refreshSeqRef.current !== refreshId) {
+        return;
+      }
+
+      const reason = error instanceof Error ? error.message : "Unknown error while refreshing app.";
+      setAppRefreshMessage(`Failed to refresh app: ${reason}`);
+    });
+  }, [parsedConfig]);
+
+  const pushResult = (next: Omit<ProbeResult, "id">) => {
+    setResults((current) => [{ ...next, id: Date.now() + Math.random() }, ...current]);
+  };
+
+  const clearResultsForService = (service: ServiceName) => {
+    setResults((current) => current.filter((item) => item.service !== service));
+  };
+
+  const getResultsForService = (service: ServiceName) => {
+    return results.filter((item) => item.service === service);
+  };
+
+  const renderServiceResults = (service: ServiceName) => {
+    const serviceResults = getResultsForService(service);
+
+    return (
+      <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-xs font-semibold text-slate-800">Results</h3>
+          <button
+            type="button"
+            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100"
+            onClick={() => clearResultsForService(service)}
+          >
+            Clear
+          </button>
         </div>
+
+        <ul className="mt-2 space-y-2">
+          {serviceResults.length === 0 && (
+            <li className="rounded-md border border-dashed border-slate-300 p-2 text-xs text-slate-500">
+              No tests run in this category yet.
+            </li>
+          )}
+          {serviceResults.map((result) => (
+            <li
+              key={result.id}
+              className={`rounded-md border p-2 text-xs ${
+                result.success
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                  : "border-red-200 bg-red-50 text-red-900"
+              }`}
+            >
+              <p className="font-semibold">{result.action}</p>
+              <p>Path: {result.path}</p>
+              <p className="mt-1">{result.message}</p>
+            </li>
+          ))}
+        </ul>
       </div>
+    );
+  };
+
+  const withProbe = async (
+    key: string,
+    service: ProbeResult["service"],
+    action: string,
+    path: string,
+    run: (app: FirebaseApp) => Promise<string>,
+  ) => {
+    if (!parsedConfig.config) {
+      pushResult({
+        service,
+        action,
+        path,
+        success: false,
+        message: parsedConfig.error ?? "Invalid Firebase configuration.",
+      });
+      return;
+    }
+
+    setRunningAction(key);
+    let app: FirebaseApp | undefined;
+
+    try {
+      const existing = getApps().find((item) => item.name === APP_NAME);
+      app = existing ?? initializeApp(parsedConfig.config, APP_NAME);
+
+      const message = await run(app);
+      pushResult({ service, action, path, success: true, message });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Unknown error";
+      pushResult({ service, action, path, success: false, message: reason });
+    } finally {
+      setRunningAction(null);
+    }
+  };
+
+  const runAuthSessionCheck = async () => {
+    await withProbe(
+      "auth-session",
+      "Authentication",
+      "Check current session",
+      "(n/a)",
+      async (app) => {
+        const auth = getAuth(app);
+        if (!auth.currentUser) {
+          return "No active user session.";
+        }
+
+        return `User is signed in with uid: ${auth.currentUser.uid}`;
+      },
+    );
+  };
+
+  const runAnonymousSignIn = async () => {
+    await withProbe(
+      "auth-anonymous",
+      "Authentication",
+      "Anonymous sign in",
+      "(n/a)",
+      async (app) => {
+        const auth = getAuth(app);
+        const userCredential = await signInAnonymously(auth);
+        return `Sign in allowed. uid: ${userCredential.user.uid}`;
+      },
+    );
+  };
+
+  const runSignOut = async () => {
+    await withProbe(
+      "auth-signout",
+      "Authentication",
+      "Sign out",
+      "(n/a)",
+      async (app) => {
+        const auth = getAuth(app);
+        await signOut(auth);
+        return "Sign out completed.";
+      },
+    );
+  };
+
+  const runDatabaseRead = async () => {
+    const dbPath = normalizeDbPath(pathInput);
+    await withProbe(
+      "db-read",
+      "Realtime Database",
+      "Read data",
+      dbPath,
+      async (app) => {
+        const db = getDatabase(app);
+        const snapshot = await get(ref(db, dbPath));
+        return snapshot.exists()
+          ? `Read allowed. Preview: ${safePreview(snapshot.val())}`
+          : "Read allowed but no data found at this path.";
+      },
+    );
+  };
+
+  const runDatabaseWrite = async () => {
+    const dbPath = normalizeDbPath(pathInput);
+    await withProbe(
+      "db-write",
+      "Realtime Database",
+      "Write data",
+      dbPath,
+      async (app) => {
+        const db = getDatabase(app);
+        await set(ref(db, dbPath), {
+          probeSource: "firebase-security-tester",
+          probedAt: new Date().toISOString(),
+        });
+        return "Write allowed. Test payload saved.";
+      },
+    );
+  };
+
+  const runFirestoreRead = async () => {
+    const docPath = normalizeFirestorePath(pathInput);
+    await withProbe(
+      "firestore-read",
+      "Firestore",
+      "Read document",
+      docPath,
+      async (app) => {
+        const database = getFirestore(app);
+        const snapshot = await getDoc(doc(database, docPath));
+        return snapshot.exists()
+          ? `Read allowed. Preview: ${safePreview(snapshot.data())}`
+          : "Read allowed but no document found at this path.";
+      },
+    );
+  };
+
+  const runFirestoreWrite = async () => {
+    const docPath = normalizeFirestorePath(pathInput);
+    await withProbe(
+      "firestore-write",
+      "Firestore",
+      "Write document",
+      docPath,
+      async (app) => {
+        const database = getFirestore(app);
+        await setDoc(
+          doc(database, docPath),
+          {
+            probeSource: "firebase-security-tester",
+            probedAt: serverTimestamp(),
+            note: "Write probe from browser",
+          },
+          { merge: true },
+        );
+
+        return "Write allowed. Probe fields merged into document.";
+      },
+    );
+  };
+
+  const runStorageList = async () => {
+    const normalizedPath = normalizeStoragePath(pathInput);
+    const path = normalizedPath || "/";
+
+    await withProbe(
+      "storage-list",
+      "Storage",
+      "List objects",
+      path,
+      async (app) => {
+        const storage = getStorage(app);
+        const rootReference = storageRef(storage, normalizedPath);
+        const listResult = await listAll(rootReference);
+
+        return `List allowed. Found ${listResult.items.length} files and ${listResult.prefixes.length} folders.`;
+      },
+    );
+  };
+
+  const runStorageWrite = async () => {
+    const normalizedPath = normalizeStoragePath(pathInput);
+    const targetPath = normalizedPath
+      ? `${normalizedPath.replace(/\/+$/g, "")}/probe.json`
+      : "security-test/probe.json";
+
+    await withProbe(
+      "storage-write",
+      "Storage",
+      "Upload object",
+      targetPath,
+      async (app) => {
+        const storage = getStorage(app);
+        const payload = JSON.stringify(
+          {
+            probeSource: "firebase-security-tester",
+            probedAt: new Date().toISOString(),
+          },
+          null,
+          2,
+        );
+
+        await uploadString(storageRef(storage, targetPath), payload, "raw", {
+          contentType: "application/json",
+        });
+
+        return "Upload allowed. Probe file saved.";
+      },
+    );
+  };
+
+  return (
+    <main className="mx-auto flex min-h-screen w-full max-w-6xl flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
+      <header className="rounded-2xl border border-slate-200 bg-slate-50 p-5">
+        <h1 className="text-2xl font-bold text-slate-900">Firebase Security Tester</h1>
+        <p className="mt-2 text-sm text-slate-700">
+          Paste Firebase web config JSON, then run probes against Authentication,
+          Realtime Database, Firestore, and Storage.
+        </p>
+      </header>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5">
+        <label htmlFor="firebase-config" className="block text-sm font-semibold text-slate-900">
+          Firebase credentials JSON
+        </label>
+        <textarea
+          id="firebase-config"
+          className="mt-2 min-h-48 w-full rounded-xl border border-slate-300 p-3 font-mono text-xs text-slate-900 focus:border-slate-500 focus:outline-none"
+          value={credentialsJson}
+          onChange={(event) => setCredentialsJson(event.target.value)}
+          aria-describedby="firebase-config-help"
+        />
+        <p id="firebase-config-help" className="mt-2 text-xs text-slate-600">
+          Supports JSON and JavaScript-style object syntax (e.g. unquoted keys). Expected keys:
+          apiKey, projectId, appId, and optional authDomain/databaseURL/storageBucket.
+        </p>
+        <p className="mt-2 text-xs text-slate-600">{appRefreshMessage}</p>
+        {parsedConfig.error && (
+          <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{parsedConfig.error}</p>
+        )}
+      </section>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5">
+        <label htmlFor="probe-path" className="block text-sm font-semibold text-slate-900">
+          Path to probe (root first)
+        </label>
+        <input
+          id="probe-path"
+          type="text"
+          className="mt-2 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-slate-500 focus:outline-none"
+          placeholder="/"
+          value={pathInput}
+          onChange={(event) => setPathInput(event.target.value)}
+        />
+        <p className="mt-2 text-xs text-slate-600">
+          Realtime Database and Storage can probe from root (/). Firestore converts empty path to
+          security_test/root_probe.
+        </p>
+      </section>
+
+      <section className="grid gap-4">
+        <details className="rounded-2xl border border-slate-200 bg-white p-4" open>
+          <summary className="cursor-pointer text-sm font-semibold text-slate-900">Authentication</summary>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runAuthSessionCheck}
+              disabled={Boolean(runningAction)}
+            >
+              Check Session
+            </button>
+            <button
+              type="button"
+              className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runAnonymousSignIn}
+              disabled={Boolean(runningAction)}
+            >
+              Anonymous Sign In
+            </button>
+            <button
+              type="button"
+              className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runSignOut}
+              disabled={Boolean(runningAction)}
+            >
+              Sign Out
+            </button>
+          </div>
+          {renderServiceResults("Authentication")}
+        </details>
+
+        <details className="rounded-2xl border border-slate-200 bg-white p-4" open>
+          <summary className="cursor-pointer text-sm font-semibold text-slate-900">Realtime Database</summary>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="rounded-lg bg-emerald-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runDatabaseRead}
+              disabled={Boolean(runningAction)}
+            >
+              Read
+            </button>
+            <button
+              type="button"
+              className="rounded-lg bg-emerald-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runDatabaseWrite}
+              disabled={Boolean(runningAction)}
+            >
+              Write
+            </button>
+          </div>
+          {renderServiceResults("Realtime Database")}
+        </details>
+
+        <details className="rounded-2xl border border-slate-200 bg-white p-4" open>
+          <summary className="cursor-pointer text-sm font-semibold text-slate-900">Firestore</summary>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="rounded-lg bg-amber-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runFirestoreRead}
+              disabled={Boolean(runningAction)}
+            >
+              Read Document
+            </button>
+            <button
+              type="button"
+              className="rounded-lg bg-amber-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runFirestoreWrite}
+              disabled={Boolean(runningAction)}
+            >
+              Write Document
+            </button>
+          </div>
+          {renderServiceResults("Firestore")}
+        </details>
+
+        <details className="rounded-2xl border border-slate-200 bg-white p-4" open>
+          <summary className="cursor-pointer text-sm font-semibold text-slate-900">Storage</summary>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="rounded-lg bg-indigo-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runStorageList}
+              disabled={Boolean(runningAction)}
+            >
+              List
+            </button>
+            <button
+              type="button"
+              className="rounded-lg bg-indigo-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runStorageWrite}
+              disabled={Boolean(runningAction)}
+            >
+              Upload
+            </button>
+          </div>
+          {renderServiceResults("Storage")}
+        </details>
+      </section>
     </main>
   );
 }
-
-const resources = [
-  {
-    href: "https://reactrouter.com/docs",
-    text: "React Router Docs",
-    icon: (
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        width="24"
-        height="20"
-        viewBox="0 0 20 20"
-        fill="none"
-        className="stroke-gray-600 group-hover:stroke-current dark:stroke-gray-300"
-      >
-        <path
-          d="M9.99981 10.0751V9.99992M17.4688 17.4688C15.889 19.0485 11.2645 16.9853 7.13958 12.8604C3.01467 8.73546 0.951405 4.11091 2.53116 2.53116C4.11091 0.951405 8.73546 3.01467 12.8604 7.13958C16.9853 11.2645 19.0485 15.889 17.4688 17.4688ZM2.53132 17.4688C0.951566 15.8891 3.01483 11.2645 7.13974 7.13963C11.2647 3.01471 15.8892 0.951453 17.469 2.53121C19.0487 4.11096 16.9854 8.73551 12.8605 12.8604C8.73562 16.9853 4.11107 19.0486 2.53132 17.4688Z"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-      </svg>
-    ),
-  },
-  {
-    href: "https://rmx.as/discord",
-    text: "Join Discord",
-    icon: (
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        width="24"
-        height="20"
-        viewBox="0 0 24 20"
-        fill="none"
-        className="stroke-gray-600 group-hover:stroke-current dark:stroke-gray-300"
-      >
-        <path
-          d="M15.0686 1.25995L14.5477 1.17423L14.2913 1.63578C14.1754 1.84439 14.0545 2.08275 13.9422 2.31963C12.6461 2.16488 11.3406 2.16505 10.0445 2.32014C9.92822 2.08178 9.80478 1.84975 9.67412 1.62413L9.41449 1.17584L8.90333 1.25995C7.33547 1.51794 5.80717 1.99419 4.37748 2.66939L4.19 2.75793L4.07461 2.93019C1.23864 7.16437 0.46302 11.3053 0.838165 15.3924L0.868838 15.7266L1.13844 15.9264C2.81818 17.1714 4.68053 18.1233 6.68582 18.719L7.18892 18.8684L7.50166 18.4469C7.96179 17.8268 8.36504 17.1824 8.709 16.4944L8.71099 16.4904C10.8645 17.0471 13.128 17.0485 15.2821 16.4947C15.6261 17.1826 16.0293 17.8269 16.4892 18.4469L16.805 18.8725L17.3116 18.717C19.3056 18.105 21.1876 17.1751 22.8559 15.9238L23.1224 15.724L23.1528 15.3923C23.5873 10.6524 22.3579 6.53306 19.8947 2.90714L19.7759 2.73227L19.5833 2.64518C18.1437 1.99439 16.6386 1.51826 15.0686 1.25995ZM16.6074 10.7755L16.6074 10.7756C16.5934 11.6409 16.0212 12.1444 15.4783 12.1444C14.9297 12.1444 14.3493 11.6173 14.3493 10.7877C14.3493 9.94885 14.9378 9.41192 15.4783 9.41192C16.0471 9.41192 16.6209 9.93851 16.6074 10.7755ZM8.49373 12.1444C7.94513 12.1444 7.36471 11.6173 7.36471 10.7877C7.36471 9.94885 7.95323 9.41192 8.49373 9.41192C9.06038 9.41192 9.63892 9.93712 9.6417 10.7815C9.62517 11.6239 9.05462 12.1444 8.49373 12.1444Z"
-          strokeWidth="1.5"
-        />
-      </svg>
-    ),
-  },
-];
