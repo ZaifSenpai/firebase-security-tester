@@ -7,7 +7,12 @@ import {
   type FirebaseApp,
   type FirebaseOptions,
 } from "firebase/app";
-import { getAuth, signInAnonymously, signOut } from "firebase/auth";
+import {
+  createUserWithEmailAndPassword,
+  getAuth,
+  signInWithEmailAndPassword,
+  signOut,
+} from "firebase/auth";
 import { getDatabase, get, ref, set } from "firebase/database";
 import {
   doc,
@@ -16,7 +21,7 @@ import {
   serverTimestamp,
   setDoc,
 } from "firebase/firestore";
-import { getStorage, listAll, ref as storageRef, uploadString } from "firebase/storage";
+import { getStorage, listAll, ref as storageRef, uploadBytes } from "firebase/storage";
 
 type ServiceName = "Authentication" | "Realtime Database" | "Firestore" | "Storage";
 
@@ -30,12 +35,13 @@ type ProbeResult = {
 };
 
 const APP_NAME = "firebase-security-tester";
+const CONFIG_STORAGE_KEY = "firebase-security-tester-config-v1";
 
 const SAMPLE_CONFIG = JSON.stringify(
   {
     apiKey: "AIza...",
     authDomain: "your-project.firebaseapp.com",
-    databaseURL: "https://your-project-default-rtdb.firebaseio.com",
+    databaseURL: "https://your-project-id.firebaseio.com",
     projectId: "your-project-id",
     storageBucket: "your-project.appspot.com",
     messagingSenderId: "1234567890",
@@ -108,15 +114,182 @@ function parseFirebaseConfig(rawText: string): { config?: FirebaseOptions; error
   }
 }
 
+function parseLooseInput(rawText: string): { value?: unknown; error?: string } {
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    return { value: undefined };
+  }
+
+  try {
+    try {
+      return { value: JSON.parse(trimmed) };
+    } catch {
+      return { value: JSON5.parse(trimmed) };
+    }
+  } catch {
+    return { error: "Invalid payload format. Use JSON or JavaScript-style object syntax." };
+  }
+}
+
+function splitEmail(baseEmail: string): { local?: string; domain?: string; error?: string } {
+  const trimmed = baseEmail.trim();
+  const atIndex = trimmed.indexOf("@");
+
+  if (atIndex <= 0 || atIndex === trimmed.length - 1) {
+    return { error: "Base email must look like name@example.com." };
+  }
+
+  return {
+    local: trimmed.slice(0, atIndex),
+    domain: trimmed.slice(atIndex + 1),
+  };
+}
+
 export function Welcome() {
   const [credentialsJson, setCredentialsJson] = useState(SAMPLE_CONFIG);
-  const [pathInput, setPathInput] = useState("/");
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [authEmail, setAuthEmail] = useState("testuser@example.com");
+  const [authPassword, setAuthPassword] = useState("password123");
+  const [bulkBaseEmail, setBulkBaseEmail] = useState("someone@gmail.com");
+  const [bulkPassword, setBulkPassword] = useState("password123");
+  const [bulkCount, setBulkCount] = useState(100);
+  const [databasePathInput, setDatabasePathInput] = useState("/");
+  const [databaseWritePayload, setDatabaseWritePayload] = useState(
+    JSON.stringify(
+      {
+        probeSource: "firebase-security-tester",
+        note: "DB write probe",
+      },
+      null,
+      2,
+    ),
+  );
+  const [firestorePathInput, setFirestorePathInput] = useState("security_test/root_probe");
+  const [firestoreWritePayload, setFirestoreWritePayload] = useState(
+    JSON.stringify(
+      {
+        probeSource: "firebase-security-tester",
+        note: "Firestore write probe",
+      },
+      null,
+      2,
+    ),
+  );
+  const [storagePathInput, setStoragePathInput] = useState("security-test");
+  const [storageUploadFile, setStorageUploadFile] = useState<File | null>(null);
   const [results, setResults] = useState<ProbeResult[]>([]);
   const [runningAction, setRunningAction] = useState<string | null>(null);
   const [appRefreshMessage, setAppRefreshMessage] = useState("Firebase app not initialized yet.");
   const refreshSeqRef = useRef(0);
+  const didRestoreConfigRef = useRef(false);
 
   const parsedConfig = useMemo(() => parseFirebaseConfig(credentialsJson), [credentialsJson]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const raw = window.localStorage.getItem(CONFIG_STORAGE_KEY);
+    if (!raw) {
+      didRestoreConfigRef.current = true;
+      return;
+    }
+
+    try {
+      const saved = JSON.parse(raw) as Partial<{
+        credentialsJson: string;
+        authMode: "login" | "signup";
+        authEmail: string;
+        authPassword: string;
+        bulkBaseEmail: string;
+        bulkPassword: string;
+        bulkCount: number;
+        databasePathInput: string;
+        databaseWritePayload: string;
+        firestorePathInput: string;
+        firestoreWritePayload: string;
+        storagePathInput: string;
+      }>;
+
+      if (typeof saved.credentialsJson === "string") {
+        setCredentialsJson(saved.credentialsJson);
+      }
+      if (saved.authMode === "login" || saved.authMode === "signup") {
+        setAuthMode(saved.authMode);
+      }
+      if (typeof saved.authEmail === "string") {
+        setAuthEmail(saved.authEmail);
+      }
+      if (typeof saved.authPassword === "string") {
+        setAuthPassword(saved.authPassword);
+      }
+      if (typeof saved.bulkBaseEmail === "string") {
+        setBulkBaseEmail(saved.bulkBaseEmail);
+      }
+      if (typeof saved.bulkPassword === "string") {
+        setBulkPassword(saved.bulkPassword);
+      }
+      if (typeof saved.bulkCount === "number" && Number.isFinite(saved.bulkCount)) {
+        setBulkCount(saved.bulkCount);
+      }
+      if (typeof saved.databasePathInput === "string") {
+        setDatabasePathInput(saved.databasePathInput);
+      }
+      if (typeof saved.databaseWritePayload === "string") {
+        setDatabaseWritePayload(saved.databaseWritePayload);
+      }
+      if (typeof saved.firestorePathInput === "string") {
+        setFirestorePathInput(saved.firestorePathInput);
+      }
+      if (typeof saved.firestoreWritePayload === "string") {
+        setFirestoreWritePayload(saved.firestoreWritePayload);
+      }
+      if (typeof saved.storagePathInput === "string") {
+        setStoragePathInput(saved.storagePathInput);
+      }
+    } catch {
+      // Ignore corrupted storage and keep defaults.
+    } finally {
+      didRestoreConfigRef.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !didRestoreConfigRef.current) {
+      return;
+    }
+
+    const toStore = {
+      credentialsJson,
+      authMode,
+      authEmail,
+      authPassword,
+      bulkBaseEmail,
+      bulkPassword,
+      bulkCount,
+      databasePathInput,
+      databaseWritePayload,
+      firestorePathInput,
+      firestoreWritePayload,
+      storagePathInput,
+    };
+
+    window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(toStore));
+  }, [
+    authEmail,
+    authMode,
+    authPassword,
+    bulkBaseEmail,
+    bulkCount,
+    bulkPassword,
+    credentialsJson,
+    databasePathInput,
+    databaseWritePayload,
+    firestorePathInput,
+    firestoreWritePayload,
+    storagePathInput,
+  ]);
 
   useEffect(() => {
     const refreshId = refreshSeqRef.current + 1;
@@ -256,16 +429,67 @@ export function Welcome() {
     );
   };
 
-  const runAnonymousSignIn = async () => {
+  const runEmailPasswordAuth = async () => {
     await withProbe(
-      "auth-anonymous",
+      authMode === "login" ? "auth-login" : "auth-signup",
       "Authentication",
-      "Anonymous sign in",
+      authMode === "login" ? "Email/Password login" : "Email/Password signup",
       "(n/a)",
       async (app) => {
         const auth = getAuth(app);
-        const userCredential = await signInAnonymously(auth);
-        return `Sign in allowed. uid: ${userCredential.user.uid}`;
+        const email = authEmail.trim();
+        const password = authPassword.trim();
+
+        if (!email || !password) {
+          throw new Error("Email and password are required.");
+        }
+
+        const userCredential =
+          authMode === "login"
+            ? await signInWithEmailAndPassword(auth, email, password)
+            : await createUserWithEmailAndPassword(auth, email, password);
+
+        return `${authMode === "login" ? "Login" : "Signup"} allowed. uid: ${userCredential.user.uid}`;
+      },
+    );
+  };
+
+  const runBulkSignup = async () => {
+    await withProbe(
+      "auth-bulk-signup",
+      "Authentication",
+      "Bulk signup",
+      "(n/a)",
+      async (app) => {
+        const auth = getAuth(app);
+        const emailParts = splitEmail(bulkBaseEmail);
+
+        if (emailParts.error || !emailParts.local || !emailParts.domain) {
+          throw new Error(emailParts.error ?? "Invalid base email.");
+        }
+
+        const total = Number.isFinite(bulkCount) ? Math.floor(bulkCount) : 0;
+        if (total <= 0) {
+          throw new Error("Bulk count must be at least 1.");
+        }
+
+        const password = bulkPassword.trim();
+        if (!password) {
+          throw new Error("Bulk password is required.");
+        }
+
+        for (let index = 1; index <= total; index += 1) {
+          const email = `${emailParts.local}${index}@${emailParts.domain}`;
+
+          try {
+            await createUserWithEmailAndPassword(auth, email, password);
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : "Unknown error";
+            throw new Error(`Stopped at ${index}/${total} (${email}): ${reason}`);
+          }
+        }
+
+        return `Bulk signup succeeded. Created ${total} users.`;
       },
     );
   };
@@ -285,7 +509,7 @@ export function Welcome() {
   };
 
   const runDatabaseRead = async () => {
-    const dbPath = normalizeDbPath(pathInput);
+    const dbPath = normalizeDbPath(databasePathInput);
     await withProbe(
       "db-read",
       "Realtime Database",
@@ -302,25 +526,27 @@ export function Welcome() {
   };
 
   const runDatabaseWrite = async () => {
-    const dbPath = normalizeDbPath(pathInput);
+    const dbPath = normalizeDbPath(databasePathInput);
     await withProbe(
       "db-write",
       "Realtime Database",
       "Write data",
       dbPath,
       async (app) => {
+        const payloadResult = parseLooseInput(databaseWritePayload);
+        if (payloadResult.error) {
+          throw new Error(payloadResult.error);
+        }
+
         const db = getDatabase(app);
-        await set(ref(db, dbPath), {
-          probeSource: "firebase-security-tester",
-          probedAt: new Date().toISOString(),
-        });
+        await set(ref(db, dbPath), payloadResult.value ?? null);
         return "Write allowed. Test payload saved.";
       },
     );
   };
 
   const runFirestoreRead = async () => {
-    const docPath = normalizeFirestorePath(pathInput);
+    const docPath = normalizeFirestorePath(firestorePathInput);
     await withProbe(
       "firestore-read",
       "Firestore",
@@ -337,21 +563,27 @@ export function Welcome() {
   };
 
   const runFirestoreWrite = async () => {
-    const docPath = normalizeFirestorePath(pathInput);
+    const docPath = normalizeFirestorePath(firestorePathInput);
     await withProbe(
       "firestore-write",
       "Firestore",
       "Write document",
       docPath,
       async (app) => {
+        const payloadResult = parseLooseInput(firestoreWritePayload);
+        if (payloadResult.error) {
+          throw new Error(payloadResult.error);
+        }
+
+        const payload = payloadResult.value;
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          throw new Error("Firestore write payload must be an object.");
+        }
+
         const database = getFirestore(app);
         await setDoc(
           doc(database, docPath),
-          {
-            probeSource: "firebase-security-tester",
-            probedAt: serverTimestamp(),
-            note: "Write probe from browser",
-          },
+          { ...payload, probedAt: serverTimestamp() },
           { merge: true },
         );
 
@@ -361,7 +593,7 @@ export function Welcome() {
   };
 
   const runStorageList = async () => {
-    const normalizedPath = normalizeStoragePath(pathInput);
+    const normalizedPath = normalizeStoragePath(storagePathInput);
     const path = normalizedPath || "/";
 
     await withProbe(
@@ -380,10 +612,25 @@ export function Welcome() {
   };
 
   const runStorageWrite = async () => {
-    const normalizedPath = normalizeStoragePath(pathInput);
-    const targetPath = normalizedPath
-      ? `${normalizedPath.replace(/\/+$/g, "")}/probe.json`
-      : "security-test/probe.json";
+    const normalizedPath = normalizeStoragePath(storagePathInput);
+
+    if (!storageUploadFile) {
+      pushResult({
+        service: "Storage",
+        action: "Upload object",
+        path: normalizedPath || "/",
+        success: false,
+        message: "Select a file before running upload.",
+      });
+      return;
+    }
+
+    const targetPath =
+      normalizedPath.length === 0
+        ? `security-test/${storageUploadFile.name}`
+        : normalizedPath.endsWith("/")
+          ? `${normalizedPath}${storageUploadFile.name}`
+          : normalizedPath;
 
     await withProbe(
       "storage-write",
@@ -392,17 +639,8 @@ export function Welcome() {
       targetPath,
       async (app) => {
         const storage = getStorage(app);
-        const payload = JSON.stringify(
-          {
-            probeSource: "firebase-security-tester",
-            probedAt: new Date().toISOString(),
-          },
-          null,
-          2,
-        );
-
-        await uploadString(storageRef(storage, targetPath), payload, "raw", {
-          contentType: "application/json",
+        await uploadBytes(storageRef(storage, targetPath), storageUploadFile, {
+          contentType: storageUploadFile.type || "application/octet-stream",
         });
 
         return "Upload allowed. Probe file saved.";
@@ -441,27 +679,46 @@ export function Welcome() {
         )}
       </section>
 
-      <section className="rounded-2xl border border-slate-200 bg-white p-5">
-        <label htmlFor="probe-path" className="block text-sm font-semibold text-slate-900">
-          Path to probe (root first)
-        </label>
-        <input
-          id="probe-path"
-          type="text"
-          className="mt-2 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-slate-500 focus:outline-none"
-          placeholder="/"
-          value={pathInput}
-          onChange={(event) => setPathInput(event.target.value)}
-        />
-        <p className="mt-2 text-xs text-slate-600">
-          Realtime Database and Storage can probe from root (/). Firestore converts empty path to
-          security_test/root_probe.
-        </p>
-      </section>
-
       <section className="grid gap-4">
         <details className="rounded-2xl border border-slate-200 bg-white p-4" open>
           <summary className="cursor-pointer text-sm font-semibold text-slate-900">Authentication</summary>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <label className="text-xs font-medium text-slate-700" htmlFor="auth-mode">
+              Mode
+            </label>
+            <select
+              id="auth-mode"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={authMode}
+              onChange={(event) => setAuthMode(event.target.value as "login" | "signup")}
+            >
+              <option value="login">Email/Password Login</option>
+              <option value="signup">Email/Password Signup</option>
+            </select>
+
+            <label className="text-xs font-medium text-slate-700" htmlFor="auth-email">
+              Email
+            </label>
+            <input
+              id="auth-email"
+              type="email"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={authEmail}
+              onChange={(event) => setAuthEmail(event.target.value)}
+            />
+
+            <label className="text-xs font-medium text-slate-700" htmlFor="auth-password">
+              Password
+            </label>
+            <input
+              id="auth-password"
+              type="password"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={authPassword}
+              onChange={(event) => setAuthPassword(event.target.value)}
+            />
+          </div>
+
           <div className="mt-4 flex flex-wrap gap-2">
             <button
               type="button"
@@ -474,10 +731,10 @@ export function Welcome() {
             <button
               type="button"
               className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
-              onClick={runAnonymousSignIn}
+              onClick={runEmailPasswordAuth}
               disabled={Boolean(runningAction)}
             >
-              Anonymous Sign In
+              {authMode === "login" ? "Run Login" : "Run Signup"}
             </button>
             <button
               type="button"
@@ -488,11 +745,83 @@ export function Welcome() {
               Sign Out
             </button>
           </div>
+
+          <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs font-semibold text-slate-800">Bulk Signup</p>
+            <div className="mt-3 grid gap-3 md:grid-cols-2">
+              <label className="text-xs font-medium text-slate-700" htmlFor="bulk-base-email">
+                Base email
+              </label>
+              <input
+                id="bulk-base-email"
+                type="email"
+                className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+                value={bulkBaseEmail}
+                onChange={(event) => setBulkBaseEmail(event.target.value)}
+              />
+
+              <label className="text-xs font-medium text-slate-700" htmlFor="bulk-password">
+                Password
+              </label>
+              <input
+                id="bulk-password"
+                type="password"
+                className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+                value={bulkPassword}
+                onChange={(event) => setBulkPassword(event.target.value)}
+              />
+
+              <label className="text-xs font-medium text-slate-700" htmlFor="bulk-count">
+                Count
+              </label>
+              <input
+                id="bulk-count"
+                type="number"
+                min={1}
+                className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+                value={bulkCount}
+                onChange={(event) => setBulkCount(Number(event.target.value))}
+              />
+            </div>
+            <p className="mt-2 text-xs text-slate-600">
+              Example: someone@gmail.com creates someone1@gmail.com to someoneN@gmail.com.
+            </p>
+            <button
+              type="button"
+              className="mt-3 rounded-lg bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={runBulkSignup}
+              disabled={Boolean(runningAction)}
+            >
+              Run Bulk Signup
+            </button>
+          </div>
           {renderServiceResults("Authentication")}
         </details>
 
         <details className="rounded-2xl border border-slate-200 bg-white p-4" open>
           <summary className="cursor-pointer text-sm font-semibold text-slate-900">Realtime Database</summary>
+          <div className="mt-4 grid gap-2">
+            <label className="text-xs font-medium text-slate-700" htmlFor="db-path">
+              Probe path
+            </label>
+            <input
+              id="db-path"
+              type="text"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={databasePathInput}
+              onChange={(event) => setDatabasePathInput(event.target.value)}
+              placeholder="/"
+            />
+            <label className="mt-2 text-xs font-medium text-slate-700" htmlFor="db-payload">
+              Write payload (JSON or JS object syntax)
+            </label>
+            <textarea
+              id="db-payload"
+              className="min-h-28 rounded-lg border border-slate-300 p-3 font-mono text-xs text-slate-900"
+              value={databaseWritePayload}
+              onChange={(event) => setDatabaseWritePayload(event.target.value)}
+            />
+          </div>
           <div className="mt-4 flex flex-wrap gap-2">
             <button
               type="button"
@@ -516,6 +845,31 @@ export function Welcome() {
 
         <details className="rounded-2xl border border-slate-200 bg-white p-4" open>
           <summary className="cursor-pointer text-sm font-semibold text-slate-900">Firestore</summary>
+          <div className="mt-4 grid gap-2">
+            <label className="text-xs font-medium text-slate-700" htmlFor="firestore-path">
+              Document path
+            </label>
+            <input
+              id="firestore-path"
+              type="text"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={firestorePathInput}
+              onChange={(event) => setFirestorePathInput(event.target.value)}
+              placeholder="security_test/root_probe"
+            />
+            <label
+              className="mt-2 text-xs font-medium text-slate-700"
+              htmlFor="firestore-payload"
+            >
+              Write payload (object syntax)
+            </label>
+            <textarea
+              id="firestore-payload"
+              className="min-h-28 rounded-lg border border-slate-300 p-3 font-mono text-xs text-slate-900"
+              value={firestoreWritePayload}
+              onChange={(event) => setFirestoreWritePayload(event.target.value)}
+            />
+          </div>
           <div className="mt-4 flex flex-wrap gap-2">
             <button
               type="button"
@@ -539,6 +893,37 @@ export function Welcome() {
 
         <details className="rounded-2xl border border-slate-200 bg-white p-4" open>
           <summary className="cursor-pointer text-sm font-semibold text-slate-900">Storage</summary>
+          <div className="mt-4 grid gap-2">
+            <label className="text-xs font-medium text-slate-700" htmlFor="storage-path">
+              Path (folder or full object path)
+            </label>
+            <input
+              id="storage-path"
+              type="text"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={storagePathInput}
+              onChange={(event) => setStoragePathInput(event.target.value)}
+              placeholder="security-test/"
+            />
+            <label className="mt-2 text-xs font-medium text-slate-700" htmlFor="storage-file">
+              File to upload
+            </label>
+            <input
+              id="storage-file"
+              type="file"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              onChange={(event) => {
+                const selected = event.target.files?.[0] ?? null;
+                setStorageUploadFile(selected);
+              }}
+            />
+            {storageUploadFile && (
+              <p className="text-xs text-slate-600">Selected: {storageUploadFile.name}</p>
+            )}
+            <p className="text-xs text-slate-600">
+              Note: browsers do not allow restoring file inputs after reload. Re-select the file each time.
+            </p>
+          </div>
           <div className="mt-4 flex flex-wrap gap-2">
             <button
               type="button"
