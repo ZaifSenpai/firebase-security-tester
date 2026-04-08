@@ -24,6 +24,7 @@ import {
 import { getStorage, listAll, ref as storageRef, uploadBytes } from "firebase/storage";
 
 type ServiceName = "Authentication" | "Realtime Database" | "Firestore" | "Storage";
+type AccessMethod = "config" | "accessToken";
 
 type ProbeResult = {
   id: number;
@@ -145,8 +146,95 @@ function splitEmail(baseEmail: string): { local?: string; domain?: string; error
   };
 }
 
+function toFirestoreValue(value: unknown): Record<string, unknown> {
+  if (value === null || value === undefined) {
+    return { nullValue: null };
+  }
+
+  if (typeof value === "boolean") {
+    return { booleanValue: value };
+  }
+
+  if (typeof value === "number") {
+    return Number.isInteger(value)
+      ? { integerValue: String(value) }
+      : { doubleValue: value };
+  }
+
+  if (typeof value === "string") {
+    return { stringValue: value };
+  }
+
+  if (Array.isArray(value)) {
+    return {
+      arrayValue: {
+        values: value.map((item) => toFirestoreValue(item)),
+      },
+    };
+  }
+
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    const fields = Object.fromEntries(entries.map(([key, val]) => [key, toFirestoreValue(val)]));
+    return { mapValue: { fields } };
+  }
+
+  return { stringValue: String(value) };
+}
+
+function fromFirestoreValue(value: Record<string, unknown> | undefined): unknown {
+  if (!value) {
+    return undefined;
+  }
+
+  if ("nullValue" in value) {
+    return null;
+  }
+  if ("booleanValue" in value) {
+    return value.booleanValue;
+  }
+  if ("integerValue" in value) {
+    return Number(value.integerValue);
+  }
+  if ("doubleValue" in value) {
+    return value.doubleValue;
+  }
+  if ("stringValue" in value) {
+    return value.stringValue;
+  }
+  if ("arrayValue" in value) {
+    const arrayValue = value.arrayValue as { values?: Record<string, unknown>[] };
+    return (arrayValue.values ?? []).map((item) => fromFirestoreValue(item));
+  }
+  if ("mapValue" in value) {
+    const mapValue = value.mapValue as { fields?: Record<string, Record<string, unknown>> };
+    const fields = mapValue.fields ?? {};
+    return Object.fromEntries(
+      Object.entries(fields).map(([key, fieldValue]) => [key, fromFirestoreValue(fieldValue)]),
+    );
+  }
+
+  return value;
+}
+
+async function parseHttpError(response: Response): Promise<string> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const body = (await response.json()) as { error?: { message?: string } };
+    return body.error?.message ?? `HTTP ${response.status}`;
+  }
+
+  const text = await response.text();
+  return text || `HTTP ${response.status}`;
+}
+
 export function Welcome() {
+  const [accessMethod, setAccessMethod] = useState<AccessMethod>("config");
   const [credentialsJson, setCredentialsJson] = useState(SAMPLE_CONFIG);
+  const [accessToken, setAccessToken] = useState("");
+  const [tokenProjectId, setTokenProjectId] = useState("");
+  const [tokenDatabaseUrl, setTokenDatabaseUrl] = useState("");
+  const [tokenStorageBucket, setTokenStorageBucket] = useState("");
   const [authMode, setAuthMode] = useState<"login" | "signup">("login");
   const [authEmail, setAuthEmail] = useState("testuser@example.com");
   const [authPassword, setAuthPassword] = useState("password123");
@@ -184,6 +272,7 @@ export function Welcome() {
   const didRestoreConfigRef = useRef(false);
 
   const parsedConfig = useMemo(() => parseFirebaseConfig(credentialsJson), [credentialsJson]);
+  const isTokenMode = accessMethod === "accessToken";
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -198,7 +287,12 @@ export function Welcome() {
 
     try {
       const saved = JSON.parse(raw) as Partial<{
+        accessMethod: AccessMethod;
         credentialsJson: string;
+        accessToken: string;
+        tokenProjectId: string;
+        tokenDatabaseUrl: string;
+        tokenStorageBucket: string;
         authMode: "login" | "signup";
         authEmail: string;
         authPassword: string;
@@ -212,8 +306,23 @@ export function Welcome() {
         storagePathInput: string;
       }>;
 
+      if (saved.accessMethod === "config" || saved.accessMethod === "accessToken") {
+        setAccessMethod(saved.accessMethod);
+      }
       if (typeof saved.credentialsJson === "string") {
         setCredentialsJson(saved.credentialsJson);
+      }
+      if (typeof saved.accessToken === "string") {
+        setAccessToken(saved.accessToken);
+      }
+      if (typeof saved.tokenProjectId === "string") {
+        setTokenProjectId(saved.tokenProjectId);
+      }
+      if (typeof saved.tokenDatabaseUrl === "string") {
+        setTokenDatabaseUrl(saved.tokenDatabaseUrl);
+      }
+      if (typeof saved.tokenStorageBucket === "string") {
+        setTokenStorageBucket(saved.tokenStorageBucket);
       }
       if (saved.authMode === "login" || saved.authMode === "signup") {
         setAuthMode(saved.authMode);
@@ -261,7 +370,12 @@ export function Welcome() {
     }
 
     const toStore = {
+      accessMethod,
       credentialsJson,
+      accessToken,
+      tokenProjectId,
+      tokenDatabaseUrl,
+      tokenStorageBucket,
       authMode,
       authEmail,
       authPassword,
@@ -277,6 +391,8 @@ export function Welcome() {
 
     window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(toStore));
   }, [
+    accessMethod,
+    accessToken,
     authEmail,
     authMode,
     authPassword,
@@ -288,10 +404,22 @@ export function Welcome() {
     databaseWritePayload,
     firestorePathInput,
     firestoreWritePayload,
+    tokenDatabaseUrl,
+    tokenProjectId,
+    tokenStorageBucket,
     storagePathInput,
   ]);
 
   useEffect(() => {
+    if (isTokenMode) {
+      const existing = getApps().find((item) => item.name === APP_NAME);
+      if (existing) {
+        void deleteApp(existing);
+      }
+      setAppRefreshMessage("Access token mode enabled. SDK app not used.");
+      return;
+    }
+
     const refreshId = refreshSeqRef.current + 1;
     refreshSeqRef.current = refreshId;
 
@@ -322,7 +450,7 @@ export function Welcome() {
       const reason = error instanceof Error ? error.message : "Unknown error while refreshing app.";
       setAppRefreshMessage(`Failed to refresh app: ${reason}`);
     });
-  }, [parsedConfig]);
+  }, [isTokenMode, parsedConfig]);
 
   const pushResult = (next: Omit<ProbeResult, "id">) => {
     setResults((current) => [{ ...next, id: Date.now() + Math.random() }, ...current]);
@@ -382,27 +510,12 @@ export function Welcome() {
     service: ProbeResult["service"],
     action: string,
     path: string,
-    run: (app: FirebaseApp) => Promise<string>,
+    run: () => Promise<string>,
   ) => {
-    if (!parsedConfig.config) {
-      pushResult({
-        service,
-        action,
-        path,
-        success: false,
-        message: parsedConfig.error ?? "Invalid Firebase configuration.",
-      });
-      return;
-    }
-
     setRunningAction(key);
-    let app: FirebaseApp | undefined;
 
     try {
-      const existing = getApps().find((item) => item.name === APP_NAME);
-      app = existing ?? initializeApp(parsedConfig.config, APP_NAME);
-
-      const message = await run(app);
+      const message = await run();
       pushResult({ service, action, path, success: true, message });
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Unknown error";
@@ -412,18 +525,72 @@ export function Welcome() {
     }
   };
 
+  const getSdkApp = () => {
+    if (!parsedConfig.config) {
+      throw new Error(parsedConfig.error ?? "Invalid Firebase configuration.");
+    }
+
+    const existing = getApps().find((item) => item.name === APP_NAME);
+    return existing ?? initializeApp(parsedConfig.config, APP_NAME);
+  };
+
+  const getAccessToken = () => {
+    const token = accessToken.trim();
+    if (!token) {
+      throw new Error("Access token is required in access token mode.");
+    }
+    return token;
+  };
+
+  const getTokenDatabaseBaseUrl = () => {
+    const url = (tokenDatabaseUrl || parsedConfig.config?.databaseURL || "").trim();
+    if (!url) {
+      throw new Error("Database URL is required for token mode.");
+    }
+    return url.replace(/\/+$/, "");
+  };
+
+  const getTokenProject = () => {
+    const project = (tokenProjectId || parsedConfig.config?.projectId || "").trim();
+    if (!project) {
+      throw new Error("Project ID is required for token mode.");
+    }
+    return project;
+  };
+
+  const getTokenStorageBucketName = () => {
+    const raw = (tokenStorageBucket || parsedConfig.config?.storageBucket || "").trim();
+    if (!raw) {
+      throw new Error("Storage bucket is required for token mode.");
+    }
+    return raw.replace(/^gs:\/\//, "");
+  };
+
   const runAuthSessionCheck = async () => {
     await withProbe(
       "auth-session",
       "Authentication",
       "Check current session",
       "(n/a)",
-      async (app) => {
-        const auth = getAuth(app);
+      async () => {
+        if (isTokenMode) {
+          const token = getAccessToken();
+          const response = await fetch(
+            `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${encodeURIComponent(token)}`,
+          );
+
+          if (!response.ok) {
+            throw new Error(await parseHttpError(response));
+          }
+
+          const tokenInfo = (await response.json()) as Record<string, unknown>;
+          return `Access token valid. Subject: ${String(tokenInfo.sub ?? "unknown")}`;
+        }
+
+        const auth = getAuth(getSdkApp());
         if (!auth.currentUser) {
           return "No active user session.";
         }
-
         return `User is signed in with uid: ${auth.currentUser.uid}`;
       },
     );
@@ -435,7 +602,12 @@ export function Welcome() {
       "Authentication",
       authMode === "login" ? "Email/Password login" : "Email/Password signup",
       "(n/a)",
-      async (app) => {
+      async () => {
+        if (isTokenMode) {
+          throw new Error("Email/password auth tests are only available in Firebase config mode.");
+        }
+
+        const app = getSdkApp();
         const auth = getAuth(app);
         const email = authEmail.trim();
         const password = authPassword.trim();
@@ -460,7 +632,12 @@ export function Welcome() {
       "Authentication",
       "Bulk signup",
       "(n/a)",
-      async (app) => {
+      async () => {
+        if (isTokenMode) {
+          throw new Error("Bulk signup is only available in Firebase config mode.");
+        }
+
+        const app = getSdkApp();
         const auth = getAuth(app);
         const emailParts = splitEmail(bulkBaseEmail);
 
@@ -500,7 +677,12 @@ export function Welcome() {
       "Authentication",
       "Sign out",
       "(n/a)",
-      async (app) => {
+      async () => {
+        if (isTokenMode) {
+          throw new Error("Sign out is only available in Firebase config mode.");
+        }
+
+        const app = getSdkApp();
         const auth = getAuth(app);
         await signOut(auth);
         return "Sign out completed.";
@@ -515,7 +697,25 @@ export function Welcome() {
       "Realtime Database",
       "Read data",
       dbPath,
-      async (app) => {
+      async () => {
+        if (isTokenMode) {
+          const token = getAccessToken();
+          const baseUrl = getTokenDatabaseBaseUrl();
+          const response = await fetch(
+            `${baseUrl}${dbPath}.json?access_token=${encodeURIComponent(token)}`,
+          );
+
+          if (!response.ok) {
+            throw new Error(await parseHttpError(response));
+          }
+
+          const payload = (await response.json()) as unknown;
+          return payload !== null && payload !== undefined
+            ? `Read allowed. Preview: ${safePreview(payload)}`
+            : "Read allowed but no data found at this path.";
+        }
+
+        const app = getSdkApp();
         const db = getDatabase(app);
         const snapshot = await get(ref(db, dbPath));
         return snapshot.exists()
@@ -532,12 +732,32 @@ export function Welcome() {
       "Realtime Database",
       "Write data",
       dbPath,
-      async (app) => {
+      async () => {
         const payloadResult = parseLooseInput(databaseWritePayload);
         if (payloadResult.error) {
           throw new Error(payloadResult.error);
         }
 
+        if (isTokenMode) {
+          const token = getAccessToken();
+          const baseUrl = getTokenDatabaseBaseUrl();
+          const response = await fetch(
+            `${baseUrl}${dbPath}.json?access_token=${encodeURIComponent(token)}`,
+            {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payloadResult.value ?? null),
+            },
+          );
+
+          if (!response.ok) {
+            throw new Error(await parseHttpError(response));
+          }
+
+          return "Write allowed. Test payload saved via REST API.";
+        }
+
+        const app = getSdkApp();
         const db = getDatabase(app);
         await set(ref(db, dbPath), payloadResult.value ?? null);
         return "Write allowed. Test payload saved.";
@@ -552,7 +772,34 @@ export function Welcome() {
       "Firestore",
       "Read document",
       docPath,
-      async (app) => {
+      async () => {
+        if (isTokenMode) {
+          const token = getAccessToken();
+          const projectId = getTokenProject();
+          const response = await fetch(
+            `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/${docPath}`,
+            {
+              headers: { Authorization: `Bearer ${token}` },
+            },
+          );
+
+          if (response.status === 404) {
+            return "Read allowed but no document found at this path.";
+          }
+
+          if (!response.ok) {
+            throw new Error(await parseHttpError(response));
+          }
+
+          const payload = (await response.json()) as { fields?: Record<string, Record<string, unknown>> };
+          const plain = Object.fromEntries(
+            Object.entries(payload.fields ?? {}).map(([key, value]) => [key, fromFirestoreValue(value)]),
+          );
+
+          return `Read allowed. Preview: ${safePreview(plain)}`;
+        }
+
+        const app = getSdkApp();
         const database = getFirestore(app);
         const snapshot = await getDoc(doc(database, docPath));
         return snapshot.exists()
@@ -569,7 +816,7 @@ export function Welcome() {
       "Firestore",
       "Write document",
       docPath,
-      async (app) => {
+      async () => {
         const payloadResult = parseLooseInput(firestoreWritePayload);
         if (payloadResult.error) {
           throw new Error(payloadResult.error);
@@ -580,6 +827,36 @@ export function Welcome() {
           throw new Error("Firestore write payload must be an object.");
         }
 
+        if (isTokenMode) {
+          const token = getAccessToken();
+          const projectId = getTokenProject();
+          const fields = Object.fromEntries(
+            Object.entries(payload as Record<string, unknown>).map(([key, value]) => [
+              key,
+              toFirestoreValue(value),
+            ]),
+          );
+
+          const response = await fetch(
+            `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/${docPath}`,
+            {
+              method: "PATCH",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ fields }),
+            },
+          );
+
+          if (!response.ok) {
+            throw new Error(await parseHttpError(response));
+          }
+
+          return "Write allowed. Probe fields written via REST API.";
+        }
+
+        const app = getSdkApp();
         const database = getFirestore(app);
         await setDoc(
           doc(database, docPath),
@@ -601,7 +878,27 @@ export function Welcome() {
       "Storage",
       "List objects",
       path,
-      async (app) => {
+      async () => {
+        if (isTokenMode) {
+          const token = getAccessToken();
+          const bucket = getTokenStorageBucketName();
+          const queryPath = normalizedPath ? `${normalizedPath}/` : "";
+          const response = await fetch(
+            `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o?delimiter=%2F&prefix=${encodeURIComponent(queryPath)}`,
+            {
+              headers: { Authorization: `Bearer ${token}` },
+            },
+          );
+
+          if (!response.ok) {
+            throw new Error(await parseHttpError(response));
+          }
+
+          const payload = (await response.json()) as { items?: unknown[]; prefixes?: unknown[] };
+          return `List allowed. Found ${(payload.items ?? []).length} files and ${(payload.prefixes ?? []).length} folders.`;
+        }
+
+        const app = getSdkApp();
         const storage = getStorage(app);
         const rootReference = storageRef(storage, normalizedPath);
         const listResult = await listAll(rootReference);
@@ -637,7 +934,30 @@ export function Welcome() {
       "Storage",
       "Upload object",
       targetPath,
-      async (app) => {
+      async () => {
+        if (isTokenMode) {
+          const token = getAccessToken();
+          const bucket = getTokenStorageBucketName();
+          const response = await fetch(
+            `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(targetPath)}`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": storageUploadFile.type || "application/octet-stream",
+              },
+              body: storageUploadFile,
+            },
+          );
+
+          if (!response.ok) {
+            throw new Error(await parseHttpError(response));
+          }
+
+          return "Upload allowed. Probe file saved via REST API.";
+        }
+
+        const app = getSdkApp();
         const storage = getStorage(app);
         await uploadBytes(storageRef(storage, targetPath), storageUploadFile, {
           contentType: storageUploadFile.type || "application/octet-stream",
@@ -659,6 +979,72 @@ export function Welcome() {
       </header>
 
       <section className="rounded-2xl border border-slate-200 bg-white p-5">
+        <label htmlFor="access-method" className="block text-sm font-semibold text-slate-900">
+          Access method
+        </label>
+        <select
+          id="access-method"
+          className="mt-2 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-slate-500 focus:outline-none"
+          value={accessMethod}
+          onChange={(event) => setAccessMethod(event.target.value as AccessMethod)}
+        >
+          <option value="config">Firebase Config (SDK)</option>
+          <option value="accessToken">Access Token (REST API)</option>
+        </select>
+
+        {isTokenMode && (
+          <div className="mt-4 grid gap-2">
+            <label htmlFor="access-token" className="text-sm font-semibold text-slate-900">
+              Access token
+            </label>
+            <textarea
+              id="access-token"
+              className="min-h-24 w-full rounded-xl border border-slate-300 p-3 font-mono text-xs text-slate-900 focus:border-slate-500 focus:outline-none"
+              value={accessToken}
+              onChange={(event) => setAccessToken(event.target.value)}
+              placeholder="ya29..."
+            />
+            <label htmlFor="token-project-id" className="mt-2 text-xs font-medium text-slate-700">
+              Project ID
+            </label>
+            <input
+              id="token-project-id"
+              type="text"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={tokenProjectId}
+              onChange={(event) => setTokenProjectId(event.target.value)}
+              placeholder="your-project-id"
+            />
+            <label htmlFor="token-database-url" className="text-xs font-medium text-slate-700">
+              Realtime Database URL
+            </label>
+            <input
+              id="token-database-url"
+              type="text"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={tokenDatabaseUrl}
+              onChange={(event) => setTokenDatabaseUrl(event.target.value)}
+              placeholder="https://your-project-id.firebaseio.com"
+            />
+            <label htmlFor="token-storage-bucket" className="text-xs font-medium text-slate-700">
+              Storage Bucket
+            </label>
+            <input
+              id="token-storage-bucket"
+              type="text"
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900"
+              value={tokenStorageBucket}
+              onChange={(event) => setTokenStorageBucket(event.target.value)}
+              placeholder="your-project.appspot.com"
+            />
+            <p className="text-xs text-slate-600">
+              Token mode runs service probes via REST API calls with Authorization: Bearer token.
+            </p>
+          </div>
+        )}
+
+        {!isTokenMode && (
+          <>
         <label htmlFor="firebase-config" className="block text-sm font-semibold text-slate-900">
           Firebase credentials JSON
         </label>
@@ -676,6 +1062,8 @@ export function Welcome() {
         <p className="mt-2 text-xs text-slate-600">{appRefreshMessage}</p>
         {parsedConfig.error && (
           <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{parsedConfig.error}</p>
+        )}
+          </>
         )}
       </section>
 
